@@ -193,6 +193,73 @@ if (project.platform == "linux-athena") {
     objCopyExe = 'aarch64-bionic-linux-gnu-objcopy'
 }
 
+['': project.cmakeBuildDirectory.resolve('x264'),
+ 'Shared': project.cmakeBuildSharedDirectory.resolve('x264'),
+ 'Debug': project.cmakeBuildDebugDirectory.resolve('x264'),
+ 'SharedDebug': project.cmakeBuildSharedDebugDirectory.resolve('x264')
+].each{ buildType, installDirectory ->
+    def buildDirectory = Paths.get(projectDir.canonicalPath).resolve('x264').resolve('build')
+
+    project.tasks.create('x264Configure' + buildType, Exec) {
+        inputs.dir 'x264'
+
+        def configureArgs = {
+            def args = ["--prefix=${installDirectory.toString()}"]
+
+            if (buildType.contains("Shared")) {
+                args = args + '--disable-static'
+            }
+
+            if (project.platform == "linux-athena") {
+                return args + '--enable-cross-compile' +
+                        '--cross-prefix=arm-frc2020-linux-gnueabi-' +
+                        '--arch=arm' +
+                        '--target-os=linux'
+            } else if (project.platform == "linux-raspbian") {
+                return args + '--enable-cross-compile' +
+                        '--cross-prefix=arm-raspbian10-linux-gnueabihf-' +
+                        '--arch=armhf' +
+                        '--target-os=linux'
+            } else if (project.platform == "linux-aarch64bionic") {
+                return args + '--enable-cross-compile' +
+                        '--cross-prefix=aarch64-bionic-linux-gnu-' +
+                        '--arch=aarch64' +
+                        '--target-os=linux'
+            }
+
+            return args
+        }
+
+        if (!Files.exists(buildDirectory)) {
+            Files.createDirectories(buildDirectory)
+        }
+        workingDir buildDirectory.toString()
+
+        executable Paths.get(projectDir.canonicalPath).resolve('x264').resolve('configure').toString()
+        args = configureArgs()
+    }
+
+    project.tasks.create('x264Make' + buildType, Exec) {
+        dependsOn 'x264Configure' + buildType
+        workingDir buildDirectory.toString()
+        def processors = Runtime.runtime.availableProcessors()
+
+        executable 'make'
+        args = ["-j${processors}"]
+        inputs.file buildDirectory.resolve("Makefile").toFile()
+    }
+
+    project.tasks.create('x264MakeInstall' + buildType, Exec) {
+        dependsOn 'x264Make' + buildType
+        workingDir buildDirectory.toString()
+
+        executable 'make'
+        args = ['install']
+        inputs.file buildDirectory.resolve("Makefile").toFile()
+    }
+}
+
+
 ['': project.cmakeBuildDirectory.resolve('ffmpeg'),
  'Shared': project.cmakeBuildSharedDirectory.resolve('ffmpeg'),
  'Debug': project.cmakeBuildDebugDirectory.resolve('ffmpeg'),
@@ -201,10 +268,12 @@ if (project.platform == "linux-athena") {
     def buildDirectory = Paths.get(projectDir.canonicalPath).resolve('ffmpeg').resolve('build')
 
     project.tasks.create('FFmpegConfigure' + buildType, Exec) {
+        dependsOn '264MakeInstall' + buildType
+
         inputs.dir 'ffmpeg'
 
         def configureArgs = {
-            def args = ['--disable-programs', '--enable-avresample', '--enable-shared', "--prefix=${installDirectory.toString()}"]
+            def args = ['--disable-programs', '--enable-avresample', '--enable-shared', '--enable-libx264', "--prefix=${installDirectory.toString()}"]
 
             if (buildType.contains("Shared")) {
                 args = args + '--disable-static'
@@ -265,16 +334,14 @@ if (project.platform == "linux-athena") {
  'SharedDebug': project.cmakeBuildSharedDebugDirectory
 ].each{ buildType, buildDirectory ->
     project.tasks.create('cmake' + buildType, Exec) {
-        if (!project.platform.startsWith('windows')) {
-            dependsOn 'FFmpegMakeInstall' + buildType
-            environment 'PKG_CONFIG_PATH', buildDirectory.resolve('ffmpeg').resolve('lib').resolve('pkgconfig').toString()
-            environment 'PKG_CONFIG_LIBDIR', buildDirectory.resolve('ffmpeg').resolve('lib').toString()
+        dependsOn 'FFmpegMakeInstall' + buildType
+        environment 'PKG_CONFIG_PATH', buildDirectory.resolve('ffmpeg').resolve('lib').resolve('pkgconfig').toString()
+        environment 'PKG_CONFIG_LIBDIR', buildDirectory.resolve('ffmpeg').resolve('lib').toString()
 
-            if (project.platform.startsWith('osx')) {
-                environment 'DYLD_LIBRARY_PATH', buildDirectory.resolve('ffmpeg').resolve('lib').toString()
-            } else {
-                environment 'LD_LIBRARY_PATH', buildDirectory.resolve('ffmpeg').resolve('lib').toString()
-            }
+        if (project.platform.startsWith('osx')) {
+            environment 'DYLD_LIBRARY_PATH', buildDirectory.resolve('ffmpeg').resolve('lib').toString()
+        } else {
+            environment 'LD_LIBRARY_PATH', buildDirectory.resolve('ffmpeg').resolve('lib').toString()
         }
 
         inputs.dir 'opencv'
@@ -413,6 +480,7 @@ if (project.platform == "linux-athena") {
                 def libDirectory = buildDirectory.resolve("lib").toFile()
                 def thirdPartyLib = buildDirectory.resolve("3rdParty").resolve("lib").toFile()
                 def ffmpegLib = buildDirectory.resolve("ffmpeg").resolve("lib").toFile()
+                def x264Lib = buildDirectory.resolve("x264").resolve("lib").toFile()
                 args '-static'
                 args '-o'
                 args "libopencv${project.libVersion}.a"
@@ -440,10 +508,18 @@ if (project.platform == "linux-athena") {
                         args it.absolutePath
                     }
 
+                    x264Lib.eachFile() {
+                        if (!it.name.endsWith('.a')) {
+                            return
+                        }
+                        args it.absolutePath
+                    }
+
                 }
                 inputs.dir buildDirectory.resolve("lib").toFile()
                 inputs.dir thirdPartyLib
                 inputs.dir ffmpegLib
+                inputs.dur x264Lib
                 outputs.file buildDirectory.resolve("lib").resolve("libopencv${project.libVersion}.a").toFile()
             }
         } else {
@@ -514,6 +590,10 @@ if (project.platform == "linux-athena") {
             from(buildDirectory.resolve("ffmpeg").resolve("lib").toFile()) {
                 include '*.so'
             }
+            from(buildDirectory.resolve("x264").resolve("lib").toFile()) {
+                include '*.so'
+            }
+
         }
         project.tasks.create('stripLibs' + buildType) {
             inputs.dir stripCopyDir
@@ -560,5 +640,5 @@ if (!project.hasProperty('skipDebug')) {
 apply from: 'publish.gradle'
 
 task wrapper(type: Wrapper) {
-    gradleVersion = '4.9'
+    gradleVersion = '5.0'
 }
